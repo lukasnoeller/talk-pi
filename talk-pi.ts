@@ -64,7 +64,7 @@ export default function (pi: ExtensionAPI) {
       insertTranscriptKey: shortcutConfig.insertTranscriptKey,
       transcribe: (filePath: string) => transcribeAudioFile(filePath, {
         ...config.whisper,
-        language: piperSelection?.whisperLanguage ?? "pt",
+        language: process.env.TALK_PI_WHISPER_LANGUAGE ?? piperSelection?.whisperLanguage ?? "pt",
         onNotify: (message, level) => activeCtx?.ui.notify(message, level ?? "info"),
       }),
     },
@@ -73,6 +73,7 @@ export default function (pi: ExtensionAPI) {
   let speechStatus = "";
   const sendTranscriptDebounce = createShortcutDebounce();
   const insertTranscriptDebounce = createShortcutDebounce();
+  const muteDebounce = createShortcutDebounce();
 
   const playbackQueue = createPlaybackQueue({
     isRecordingBlocked: () => voiceSession.status !== "idle",
@@ -128,6 +129,12 @@ export default function (pi: ExtensionAPI) {
     await persistVoiceSettingsMute(muted);
     await playbackQueue.setMuted(muted);
     syncStatus(ctx);
+  };
+
+  const toggleMute = async (ctx: ExtensionContext): Promise<void> => {
+    const nextMuted = !muteState.isMuted();
+    await setMuteState(nextMuted, ctx);
+    ctx.ui.notify(nextMuted ? "Extension muted" : "Extension unmuted", "info");
   };
 
   pi.on("session_start", async (_event, ctx) => {
@@ -209,6 +216,11 @@ export default function (pi: ExtensionAPI) {
 
           if (matchesKey(data, "escape") && playbackQueue.isPlaying()) {
             void playbackQueue.stop().then(() => syncStatus(activeCtx ?? ctx));
+            return;
+          }
+
+          if (matchesKey(data, shortcutConfig.muteKey) && muteDebounce.allow()) {
+            void toggleMute(activeCtx ?? ctx);
             return;
           }
 

@@ -1,7 +1,9 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import https from "node:https";
+import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { resolveToolPath } from "../tools.ts";
 
@@ -33,6 +35,7 @@ export type WhisperConfig = {
   modelPath?: string;
   modelUrl?: string;
   language?: string;
+  cliPath?: string;
   env?: NodeJS.ProcessEnv;
   onNotify?: (message: string, level?: "info" | "warning" | "error") => void;
 };
@@ -121,7 +124,7 @@ async function createContextWithRetry(modelPath: string, options: WhisperConfig,
   }
 }
 
-export async function transcribeAudioFile(filePath: string, options: WhisperConfig = {}): Promise<WhisperResult> {
+async function transcribeWithAddon(filePath: string, options: WhisperConfig): Promise<WhisperResult> {
   const modelPath = await ensureWhisperModel(options);
   const { transcribeAsync } = loadWhisperModule();
 
@@ -144,4 +147,100 @@ export async function transcribeAudioFile(filePath: string, options: WhisperConf
   }));
   const text = String(segments.map((segment) => segment.text).join(" ")).trim();
   return { text, language: result?.language, segments };
+}
+
+function resolveWhisperCliPath(env: NodeJS.ProcessEnv = process.env): string {
+  const explicit = env.TALK_PI_WHISPER_CLI?.trim();
+  if (explicit) return explicit;
+  return resolveToolPath(["whisper", "whisper-cli"], { env });
+}
+
+async function runWhisperCli(cliPath: string, args: string[], timeoutMs: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(cliPath, args, { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`whisper-cli timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += String(chunk);
+    });
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(new Error(`whisper-cli exited with code ${code}: ${stderr.trim()}`));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+async function transcribeWithCli(filePath: string, options: WhisperConfig): Promise<WhisperResult> {
+  const env = options.env ?? process.env;
+  const modelPath = await ensureWhisperModel(options);
+  const cliPath = options.cliPath?.trim() || resolveWhisperCliPath(env);
+  const language = options.language?.trim().toLowerCase() || "pt";
+  const threads = env.TALK_PI_WHISPER_THREADS?.trim() || "2";
+  const outputBase = path.join(os.tmpdir(), `talk-pi-whisper-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const outputJson = `${outputBase}.json`;
+
+  options.onNotify?.(`Talk-pi: Transcribing with whisper-cli…`, "info");
+
+  await runWhisperCli(cliPath, [
+    "-m", modelPath,
+    "-f", filePath,
+    "-l", language,
+    "-t", threads,
+    "-oj",
+    "-of", outputBase,
+  ], 600000);
+
+  let raw: string;
+  try {
+    raw = await fsp.readFile(outputJson, "utf8");
+  } catch (error) {
+    throw new Error(`whisper-cli did not produce ${outputJson}: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    await fsp.unlink(outputJson).catch(() => undefined);
+  }
+
+  const parsed = JSON.parse(raw) as {
+    result?: { language?: string };
+    transcription?: Array<{
+      text?: string;
+      offsets?: { from?: number; to?: number };
+      timestamps?: { from?: string; to?: string };
+    }>;
+  };
+
+  const segments = (parsed.transcription ?? []).map((segment) => ({
+    start: segment.offsets?.from != null ? String(segment.offsets.from) : (segment.timestamps?.from ?? ""),
+    end: segment.offsets?.to != null ? String(segment.offsets.to) : (segment.timestamps?.to ?? ""),
+    text: String(segment.text ?? "").trim(),
+  }));
+  const text = segments.map((segment) => segment.text).join(" ").trim();
+  return { text, language: parsed.result?.language, segments };
+}
+
+export async function transcribeAudioFile(filePath: string, options: WhisperConfig = {}): Promise<WhisperResult> {
+  try {
+    return await transcribeWithAddon(filePath, options);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (
+      message.includes("whisper-cpp-node") ||
+      message.includes("Unsupported platform") ||
+      message.includes("Native binary not found") ||
+      message.includes("Failed to load native addon")
+    ) {
+      return await transcribeWithCli(filePath, options);
+    }
+    throw error;
+  }
 }
